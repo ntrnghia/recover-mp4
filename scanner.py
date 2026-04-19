@@ -262,6 +262,8 @@ def _find_next_video(f, start, end):
         if not block:
             break
         block_len = len(block)
+        if block_len < len(AUD_PATTERN):
+            break
 
         idx = 0
         while True:
