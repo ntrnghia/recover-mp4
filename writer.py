@@ -17,15 +17,20 @@ def write_output(corrupted_path, output_path, scan_info, moov):
         src.seek(0)
         dst.write(src.read(mdat_offset))
 
+        # Detect original mdat header size (8 standard, 16 extended)
+        src.seek(mdat_offset)
+        orig_size_field = struct.unpack('>I', src.read(4))[0]
+        orig_hdr_size = 16 if orig_size_field == 1 else 8
+
         # Write mdat with correct size header
         if mdat_size > 0xFFFFFFFF:
             dst.write(struct.pack('>I4sQ', 1, b'mdat', mdat_size))
-            src.seek(mdat_offset + 8)
-            remaining = mdat_size - 16
+            src.seek(mdat_offset + orig_hdr_size)
+            remaining = mdat_size - orig_hdr_size
         else:
             dst.write(struct.pack('>I4s', mdat_size, b'mdat'))
-            src.seek(mdat_offset + 8)
-            remaining = mdat_size - 8
+            src.seek(mdat_offset + orig_hdr_size)
+            remaining = mdat_size - orig_hdr_size
 
         # Stream mdat content
         BUF = 4 * 1024 * 1024
@@ -41,191 +46,217 @@ def write_output(corrupted_path, output_path, scan_info, moov):
 
 
 def fix_audio(output_path):
-    """Re-encode audio with ffmpeg to fix frame boundary errors.
-
-    Raw AAC frames in mdat lack self-delimiting markers, so frame boundary
-    detection is imprecise. Re-encoding audio fixes decode errors while
-    keeping the perfect video stream untouched.
-
-    Strategy: extract video (untouched) and re-encode audio separately,
-    then merge. If audio re-encode crashes, use segment-based processing
-    on audio only (never segments the video, avoiding dts overlap issues).
-    """
+    """Fix audio: validate AAC stream, re-encode only if needed."""
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
         print("  WARNING: ffmpeg not found - skipping audio fix.")
         print("  Run manually: ffmpeg -i OUTPUT -c:v copy -c:a aac -b:a 192k FIXED.mp4")
         return False
 
-    tmp = output_path + '.tmp.mp4'
-
-    # First try simple single-pass re-encode with error tolerance
-    result = subprocess.run(
-        [ffmpeg, '-y', '-v', 'error',
-         '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
-         '-i', output_path,
-         '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
-         '-af', 'asetpts=N/SR/TB', tmp],
-        capture_output=True, text=True, timeout=7200)
-    if result.returncode == 0:
-        os.replace(tmp, output_path)
+    # Check if audio decodes cleanly (lossless path)
+    r = subprocess.run(
+        [ffmpeg, '-v', 'error', '-i', output_path, '-vn', '-f', 'null', '-'],
+        capture_output=True, text=True, timeout=600)
+    aac_errors = [l for l in (r.stderr or '').split('\n')
+                  if l.strip() and 'aac' in l.lower()]
+    if not aac_errors:
+        print("  Audio is clean (lossless).")
         return True
-    if os.path.exists(tmp):
-        os.remove(tmp)
 
-    # Get duration for segment-based fallback
-    duration = _probe_duration(ffmpeg, output_path)
+    print(f"  {len(aac_errors)} AAC errors found, re-encoding audio...")
+    return _fix_audio_reencode(output_path, ffmpeg)
 
-    print(f"  Single-pass failed, using split-merge approach ({duration:.0f}s)...")
 
-    base = os.path.splitext(output_path)[0]
-    video_only = f"{base}_vidtmp.mp4"
-    audio_fixed = f"{base}_audtmp.m4a"
-    seg_files = []
-    concat_list = f"{base}_concat.txt"
+def _print_seg_progress(done, total, lossless, reencoded, silent, t0, action):
+    """Print a single-line progress bar for segment processing."""
+    import time as _time
+    pct = 100 * done / total if total else 0
+    filled = int(30 * done / total) if total else 0
+    bar = '#' * filled + '-' * (30 - filled)
+    elapsed = _time.perf_counter() - t0
+    eta = (elapsed / done * (total - done)) if done > 0 else 0
+    status = f"L:{lossless} R:{reencoded} S:{silent}"
+    print(f"\r  [{bar}] {done}/{total} ({pct:.0f}%) "
+          f"{status} [{action}] "
+          f"elapsed:{elapsed:.0f}s eta:{eta:.0f}s   ",
+          end='', flush=True)
 
-    def _cleanup():
-        for p in [video_only, audio_fixed, tmp, concat_list]:
-            try:
-                if os.path.exists(p):
-                    os.remove(p)
-            except OSError:
-                pass
-        for sf in seg_files:
-            try:
-                os.remove(sf)
-            except OSError:
-                pass
+
+def _fix_audio_reencode(output_path, ffmpeg):
+    """Hybrid audio fix: lossless copy for clean segments, re-encode corrupt ones.
+
+    Optimised pipeline:
+    1. Extract full audio track once (copy) — avoids repeated seeks into large file
+    2. Extract + test segments in parallel from the small audio file
+    3. Re-encode only bad segments in parallel
+    4. Concatenate all segments and mux back with original video
+    """
+    import tempfile
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    seg_dur = 2  # seconds per segment (small to maximize lossless)
+
+    # Get total duration
+    r = subprocess.run(
+        [ffmpeg, '-i', output_path],
+        capture_output=True, text=True, timeout=30)
+    duration = 0.0
+    for line in (r.stderr or '').split('\n'):
+        m = re.search(r'Duration:\s*(\d+):(\d+):(\d+)\.(\d+)', line)
+        if m:
+            duration = (int(m.group(1)) * 3600 + int(m.group(2)) * 60 +
+                        int(m.group(3)) + int(m.group(4)) / 100)
+            break
+    if duration <= 0:
+        print("  WARNING: Could not determine duration.")
+        return False
+
+    total_segs = int(duration / seg_dur) + (1 if duration % seg_dur else 0)
+    workers = min(8, os.cpu_count() or 4)
+    tmpdir = tempfile.mkdtemp(prefix='recover_mp4_')
+    t0 = _time.perf_counter()
 
     try:
-        # Extract video (untouched)
+        # Phase 1: Extract full audio track (fast stream-copy from source)
+        print("  Extracting audio track...", end='', flush=True)
+        full_audio = os.path.join(tmpdir, 'full_audio.m4a')
         r = subprocess.run(
             [ffmpeg, '-y', '-v', 'error', '-i', output_path,
-             '-an', '-c:v', 'copy', video_only],
-            capture_output=True, text=True, timeout=600)
+             '-vn', '-c:a', 'copy', full_audio],
+            capture_output=True, text=True, timeout=120)
         if r.returncode != 0:
-            print("  WARNING: Video extraction failed.")
+            print(f" failed.")
             return False
+        print(" done.")
 
-        # Try single-pass audio-only re-encode
-        r = subprocess.run(
-            [ffmpeg, '-y', '-v', 'error',
-             '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
-             '-i', output_path,
-             '-vn', '-c:a', 'aac', '-b:a', '192k',
-             '-af', 'asetpts=N/SR/TB', audio_fixed],
-            capture_output=True, text=True, timeout=7200)
+        # Phase 2: Extract + test segments in parallel (from small audio file)
+        seg_files = [os.path.join(tmpdir, f'seg_{i:05d}.m4a')
+                     for i in range(total_segs)]
 
-        if r.returncode != 0:
-            # Segment-based audio-only re-encode
-            if os.path.exists(audio_fixed):
-                os.remove(audio_fixed)
-
-            seg_idx = [0]
-            skipped = 0.0
-
-            def _try_seg(ss, dur, path):
-                r = subprocess.run(
-                    [ffmpeg, '-y', '-v', 'error',
-                     '-err_detect', 'ignore_err',
-                     '-fflags', '+genpts+discardcorrupt',
-                     '-ss', f'{ss:.3f}', '-t', f'{dur:.3f}',
-                     '-i', output_path, '-vn', '-c:a', 'aac', '-b:a', '192k',
-                     '-af', 'asetpts=N/SR/TB', path],
-                    capture_output=True, text=True, timeout=600)
-                return r.returncode == 0
-
-            def _next_seg():
-                p = f"{base}_aseg{seg_idx[0]:04d}.m4a"
-                seg_idx[0] += 1
-                return p
-
-            t = 0.0
-            seg_dur = 60.0
-            sub_dur = 10.0
-
-            while t < duration:
-                chunk_len = min(seg_dur, duration - t)
-                seg_path = _next_seg()
-
-                if _try_seg(t, chunk_len, seg_path):
-                    seg_files.append(seg_path)
-                    t += chunk_len
-                else:
-                    if os.path.exists(seg_path):
-                        os.remove(seg_path)
-                    st = t
-                    while st < t + chunk_len:
-                        sub_len = min(sub_dur, t + chunk_len - st)
-                        sub_path = _next_seg()
-                        if _try_seg(st, sub_len, sub_path):
-                            seg_files.append(sub_path)
-                        else:
-                            skipped += sub_len
-                            if os.path.exists(sub_path):
-                                os.remove(sub_path)
-                        st += sub_len
-                    t += chunk_len
-
-            if not seg_files:
-                print("  WARNING: All audio segments failed.")
-                return False
-
-            # Concat audio segments
-            with open(concat_list, 'w') as cl:
-                for sf in seg_files:
-                    cl.write(f"file '{os.path.basename(sf)}'\n")
-
+        def extract_and_test(i):
+            """Extract segment from full_audio and test for AAC errors."""
+            ss = i * seg_dur
+            t = min(seg_dur, duration - ss)
+            seg_path = seg_files[i]
             r = subprocess.run(
-                [ffmpeg, '-y', '-v', 'error', '-f', 'concat', '-safe', '0',
-                 '-i', concat_list, '-c', 'copy', audio_fixed],
-                capture_output=True, text=True, timeout=600)
+                [ffmpeg, '-y', '-v', 'error',
+                 '-ss', f'{ss:.3f}', '-t', f'{t:.3f}',
+                 '-i', full_audio, '-vn', '-c:a', 'copy', seg_path],
+                capture_output=True, text=True, timeout=60)
+            if r.returncode != 0 or not os.path.exists(seg_path):
+                return 'bad'
+            r2 = subprocess.run(
+                [ffmpeg, '-v', 'error', '-i', seg_path, '-f', 'null', '-'],
+                capture_output=True, text=True, timeout=60)
+            errs = [l for l in (r2.stderr or '').split('\n')
+                    if l.strip() and 'aac' in l.lower()]
+            return 'bad' if errs else 'good'
 
-            for sf in seg_files:
+        bad_indices = set()
+        done = 0
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(extract_and_test, i): i
+                       for i in range(total_segs)}
+            for future in as_completed(futures):
+                if future.result() == 'bad':
+                    bad_indices.add(futures[future])
+                done += 1
+                if done % 20 == 0 or done == total_segs:
+                    _print_seg_progress(done, total_segs,
+                                        done - len(bad_indices), 0, 0,
+                                        t0, 'testing')
+
+        # Phase 3: Re-encode bad segments in parallel
+        reencoded = 0
+        silent = 0
+
+        def fix_seg(i):
+            """Re-encode a bad segment; fall back to silence on failure."""
+            ss = i * seg_dur
+            t = min(seg_dur, duration - ss)
+            seg_path = seg_files[i]
+            tmp_path = seg_path + '.tmp.m4a'
+            r = subprocess.run(
+                [ffmpeg, '-y', '-v', 'error',
+                 '-err_detect', 'ignore_err',
+                 '-fflags', '+genpts+discardcorrupt',
+                 '-ss', f'{ss:.3f}', '-t', f'{t:.3f}',
+                 '-i', full_audio,
+                 '-c:a', 'aac', '-ac', '2', '-b:a', '192k', tmp_path],
+                capture_output=True, text=True, timeout=120)
+            if r.returncode == 0 and os.path.exists(tmp_path):
+                os.replace(tmp_path, seg_path)
+                return 'reencoded'
+            if os.path.exists(tmp_path):
                 try:
-                    os.remove(sf)
+                    os.remove(tmp_path)
                 except OSError:
                     pass
-            seg_files.clear()
-            try:
-                os.remove(concat_list)
-            except OSError:
-                pass
+            subprocess.run(
+                [ffmpeg, '-y', '-v', 'error',
+                 '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
+                 '-t', f'{t:.3f}',
+                 '-c:a', 'aac', '-b:a', '192k', seg_path],
+                capture_output=True, text=True, timeout=30)
+            return 'silent'
 
-            if r.returncode != 0:
-                print("  WARNING: Audio concat failed.")
-                return False
+        if bad_indices:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(fix_seg, i): i for i in bad_indices}
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result == 'reencoded':
+                        reencoded += 1
+                    else:
+                        silent += 1
 
-            if skipped > 0:
-                print(f"  Re-encoded audio in segments ({skipped:.0f}s gaps).")
+        lossless = total_segs - len(bad_indices)
+        print(f"\r  Segments: {lossless}/{total_segs} lossless, "
+              f"{reencoded}/{total_segs} re-encoded, "
+              f"{silent}/{total_segs} silence.{' ' * 20}")
 
-        # Merge video + fixed audio
+        # Phase 4: Concatenate all segments
+        print("  Concatenating segments...", end='', flush=True)
+        concat_list = os.path.join(tmpdir, 'concat.txt')
+        with open(concat_list, 'w') as f:
+            for seg in seg_files:
+                f.write(f"file '{seg}'\n")
+
+        concat_audio = os.path.join(tmpdir, 'concat_audio.m4a')
         r = subprocess.run(
             [ffmpeg, '-y', '-v', 'error',
-             '-i', video_only, '-i', audio_fixed,
-             '-c', 'copy', '-map', '0:v', '-map', '1:a', tmp],
-            capture_output=True, text=True, timeout=600)
-
-        if r.returncode == 0:
-            os.replace(tmp, output_path)
-            _cleanup()
-            return True
-        else:
-            print("  WARNING: Final merge failed.")
+             '-f', 'concat', '-safe', '0', '-i', concat_list,
+             '-c:a', 'copy', concat_audio],
+            capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            print(f"\n  WARNING: Concat failed: {(r.stderr or '')[-200:]}")
             return False
+        print(" done.")
 
+        # Phase 5: Mux original video + fixed audio
+        print("  Muxing video + fixed audio...", end='', flush=True)
+        tmp = output_path + '.tmp.mp4'
+        r = subprocess.run(
+            [ffmpeg, '-y', '-v', 'error',
+             '-i', output_path, '-i', concat_audio,
+             '-map', '0:v', '-map', '1:a',
+             '-c:v', 'copy', '-c:a', 'copy',
+             '-movflags', '+faststart', tmp],
+            capture_output=True, text=True, timeout=3600)
+        if r.returncode == 0 and os.path.exists(tmp):
+            os.replace(tmp, output_path)
+            elapsed = _time.perf_counter() - t0
+            print(f" done. ({elapsed:.1f}s)")
+            print("  Audio fixed.")
+            return True
+        print(f"\n  WARNING: Final mux failed: {(r.stderr or '')[-200:]}")
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False
     finally:
-        _cleanup()
-
-
-def _probe_duration(ffmpeg, path):
-    """Probe file duration in seconds using ffmpeg."""
-    probe = subprocess.run(
-        [ffmpeg, '-i', path], capture_output=True, text=True, timeout=30)
-    for line in (probe.stderr or '').split('\n'):
-        m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', line)
-        if m:
-            return (int(m.group(1)) * 3600 +
-                    int(m.group(2)) * 60 +
-                    float(m.group(3)))
-    return 7200
+        import shutil as _shutil
+        _shutil.rmtree(tmpdir, ignore_errors=True)

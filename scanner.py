@@ -27,7 +27,8 @@ def scan_mdat(corrupted_path, ref_info):
     audio_chunks, sync_samples, slice_types, has_b_frames,
     mdat_offset, mdat_size.
     """
-    spc = ref_info['audio']['samples_per_chunk']
+    audio_ref = ref_info['audio']
+    spc = audio_ref['samples_per_chunk']
 
     with open(corrupted_path, 'rb') as f:
         f.seek(0, 2)
@@ -169,12 +170,12 @@ def scan_mdat(corrupted_path, ref_info):
             if next_video is None:
                 if pos < mdat_end:
                     _create_audio_chunk(f, audio_start, mdat_end, spc,
-                                        audio_samples, audio_chunks)
+                                        audio_samples, audio_chunks, audio_ref)
                 break
 
             if next_video > audio_start:
                 _create_audio_chunk(f, audio_start, next_video, spc,
-                                    audio_samples, audio_chunks)
+                                    audio_samples, audio_chunks, audio_ref)
 
             pos = next_video
 
@@ -289,14 +290,14 @@ def _find_next_video(f, start, end):
 # ─── Audio chunk detection ───────────────────────────────────────────────────
 
 def _create_audio_chunk(f, start, end, samples_per_chunk,
-                        audio_samples, audio_chunks):
+                        audio_samples, audio_chunks, audio_ref=None):
     """Split an audio region into samples using AAC frame boundary detection."""
     chunk_size = end - start
     if chunk_size < 10:
         return
 
     n = samples_per_chunk
-    min_aac_frame = 50
+    min_aac_frame = (audio_ref.get('frame_size_min') or 50) if audio_ref else 50
     if chunk_size < n * min_aac_frame:
         n = max(1, chunk_size // min_aac_frame)
 
@@ -307,7 +308,8 @@ def _create_audio_chunk(f, start, end, samples_per_chunk,
             f.seek(start)
             chunk_data = f.read(chunk_size)
             if len(chunk_data) == chunk_size:
-                boundaries = _find_aac_boundaries(chunk_data, n)
+                boundaries = _find_aac_boundaries(
+                    chunk_data, n, audio_ref)
 
     chunk_sample_indices = []
     if boundaries and len(boundaries) == n + 1:
@@ -331,50 +333,163 @@ def _create_audio_chunk(f, start, end, samples_per_chunk,
     audio_chunks.append((start, chunk_sample_indices))
 
 
-def _find_aac_boundaries(chunk_data, num_frames):
+def _find_aac_boundaries(chunk_data, num_frames, audio_ref=None):
     """Find AAC-LC frame boundaries using DP minimum-variance partition.
 
-    Uses C-level bytes.find for candidate search (vs Python loop per byte).
-    Caps candidates at 500 and uses bisect for O(n*c*log(c)) DP.
+    Uses candidate quality scoring and reference-weighted cost to prefer
+    boundaries that produce frame sizes matching the known distribution.
+    Tries tight reference-based bounds first, falls back to loose bounds.
     """
+    ar = audio_ref or {}
+    ref_min = ar.get('frame_size_min')
+    ref_max = ar.get('frame_size_max')
+    ref_mean = ar.get('frame_size_mean')
+    ref_stdev = ar.get('frame_size_stdev')
+    ref_msf_long = ar.get('dominant_msf_long')
+    ref_msf_short = ar.get('dominant_msf_short')
+    ref_ms = ar.get('dominant_ms')
+
     chunk_size = len(chunk_data)
     target_size = chunk_size / num_frames
-    min_size = max(50, int(target_size * 0.15))
-    max_size = int(target_size * 3.0)
 
-    # Build candidates using C-level bytes.find (much faster than Python loop)
+    # Build candidates with quality scores
+    # Score reflects how likely a candidate is a real CPE header
     candidates = [0]
+    cand_scores = [0]  # position 0 is always valid (neutral score)
+
     for target_byte in (b'\x20', b'\x21'):
+        is_cw1 = (target_byte == b'\x21')
         idx = 1
-        while idx < chunk_size - 2:
-            found = chunk_data.find(target_byte, idx, chunk_size - 2)
+        while idx < chunk_size - 3:
+            found = chunk_data.find(target_byte, idx, chunk_size - 3)
             if found < 0:
                 break
-            b1, b2 = chunk_data[found + 1], chunk_data[found + 2]
-            # Validate AAC-LC CPE header: ics_reserved=0, predictor=0, max_sfb
-            if not (b1 & 0x80) and not (b2 & 0x20):
-                ws = (b1 >> 5) & 0x03
+            b1 = chunk_data[found + 1]
+            b2 = chunk_data[found + 2]
+
+            # ics_reserved_bit must be 0
+            if b1 & 0x80:
+                idx = found + 1
+                continue
+
+            ws = (b1 >> 5) & 0x03
+
+            if ws == 2:  # EIGHT_SHORT: 4-bit max_sfb
+                msf = b1 & 0x0F
+                if msf > 14:
+                    idx = found + 1
+                    continue
+            else:  # Long windows: 6-bit max_sfb + predictor must be 0
                 msf = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)
-                if (ws == 2 and msf <= 14) or (ws != 2 and msf <= 49):
-                    candidates.append(found)
+                if msf > 49:
+                    idx = found + 1
+                    continue
+                if b2 & 0x20:  # predictor_data_present must be 0
+                    idx = found + 1
+                    continue
+
+            # Quality scoring
+            score = 0
+            if is_cw1:
+                score += 3  # common_window=1 is dominant for stereo
+
+            if ws == 0:  # ONLY_LONG most common (~90%+)
+                score += 2
+            elif ws == 2:  # EIGHT_SHORT is rare
+                score -= 1
+
+            # max_sfb matching: strongest discriminator
+            if ws == 2:
+                if ref_msf_short is not None and msf == ref_msf_short:
+                    score += 6
+            else:
+                if ref_msf_long is not None:
+                    if msf == ref_msf_long:
+                        score += 6
+                    elif msf == 0:
+                        score += 1  # silence frames have msf=0
+                    else:
+                        score -= 3  # wrong msf is a strong negative signal
+
+            # Check ms_mask_present for CW=1 long windows
+            if is_cw1 and ws != 2:
+                ms_mask = (b2 >> 3) & 0x03
+                if ms_mask == 3:  # reserved value → reject
+                    idx = found + 1
+                    continue
+                if ref_ms is not None:
+                    if ms_mask == ref_ms:
+                        score += 3
+                    else:
+                        score -= 1
+                elif ms_mask <= 1:
+                    score += 1
+
+            candidates.append(found)
+            cand_scores.append(score)
             idx = found + 1
-    candidates.sort()
+
+    # Sort candidates (and scores together)
+    if len(candidates) > 1:
+        pairs = sorted(zip(candidates, cand_scores))
+        candidates = [p[0] for p in pairs]
+        cand_scores = [p[1] for p in pairs]
     nc = len(candidates)
 
     if nc < num_frames:
         return None
 
-    # Safety cap: subsample to keep DP tractable
+    # Safety cap: subsample to keep DP tractable, preserving high-quality candidates
     MAX_CANDIDATES = 500
     if nc > MAX_CANDIDATES:
-        step = nc / MAX_CANDIDATES
-        sampled = [candidates[0]]
-        for i in range(1, MAX_CANDIDATES):
-            sampled.append(candidates[int(i * step)])
-        candidates = sampled
+        # Always keep index 0; keep all high-quality, subsample low-quality
+        high_q = [i for i in range(1, nc) if cand_scores[i] >= 8]
+        low_q = [i for i in range(1, nc) if cand_scores[i] < 8]
+        budget = MAX_CANDIDATES - 1 - len(high_q)
+        if budget > 0 and len(low_q) > budget:
+            step = len(low_q) / budget
+            low_q = [low_q[int(j * step)] for j in range(budget)]
+        elif budget <= 0:
+            low_q = []
+        sampled_indices = sorted({0} | set(high_q) | set(low_q))
+        candidates = [candidates[i] for i in sampled_indices]
+        cand_scores = [cand_scores[i] for i in sampled_indices]
         nc = len(candidates)
 
-    # DP with bisect-bounded inner loop
+    # Use reference stats for cost function
+    cost_mean = ref_mean if ref_mean else target_size
+    cost_scale = ref_stdev if ref_stdev and ref_stdev > 0 else max(1.0, target_size * 0.08)
+    # Precompute for DP inner loop: inverse scale and pre-scaled quality bonuses
+    inv_scale = 1.0 / cost_scale
+    quality_weight = cost_scale * 0.6
+    scaled_scores = [s * quality_weight for s in cand_scores]
+
+    # Try tight bounds first, then loose
+    bounds_list = []
+    if ref_min is not None and ref_max is not None:
+        bounds_list.append((max(1, int(ref_min * 0.7)),
+                            int(ref_max * 1.3)))
+    bounds_list.append((max(50, int(target_size * 0.15)),
+                        int(target_size * 3.0)))
+
+    for min_size, max_size in bounds_list:
+        result = _dp_solve(candidates, scaled_scores, num_frames,
+                           chunk_size, cost_mean, inv_scale,
+                           min_size, max_size)
+        if result is not None:
+            return result
+
+    return None
+
+
+def _dp_solve(candidates, scaled_scores, num_frames, chunk_size,
+              cost_mean, inv_scale, min_size, max_size):
+    """DP partition with quality-weighted cost.
+
+    scaled_scores: pre-multiplied quality bonuses per candidate.
+    inv_scale: 1.0 / cost_scale for replacing division with multiplication.
+    """
+    nc = len(candidates)
     INF = float('inf')
     dp = [[INF] * nc for _ in range(num_frames)]
     parent = [[-1] * nc for _ in range(num_frames)]
@@ -392,8 +507,9 @@ def _find_aac_boundaries(chunk_data, num_frames):
             lo = bisect_left(candidates, p + min_size, ci + 1)
             hi = bisect_right(candidates, p + max_size, lo)
             for cj in range(lo, hi):
-                cost = (candidates[cj] - p - target_size) ** 2
-                total = base + cost
+                frame_size = candidates[cj] - p
+                z = (frame_size - cost_mean) * inv_scale
+                total = base + z * z - scaled_scores[cj]
                 if total < dp_next[cj]:
                     dp_next[cj] = total
                     par_next[cj] = ci
@@ -408,7 +524,8 @@ def _find_aac_boundaries(chunk_data, num_frames):
         last_size = chunk_size - candidates[ci]
         if last_size < min_size or last_size > max_size:
             continue
-        total = dp_last[ci] + (last_size - target_size) ** 2
+        z = (last_size - cost_mean) * inv_scale
+        total = dp_last[ci] + z * z
         if total < best_cost:
             best_cost = total
             best_ci = ci

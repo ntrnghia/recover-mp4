@@ -58,10 +58,8 @@ def main():
     print("\n[4/5] Writing output file...")
     write_output(corrupted, output, scan, moov)
 
-    print("\n[5/5] Fixing audio (ffmpeg re-encode)...")
-    ok = fix_audio(output)
-    if ok:
-        print("  Audio fixed successfully.")
+    print("\n[5/5] Fixing audio...")
+    fix_audio(output)
 
     vs = len(scan['video_samples'])
     aus = len(scan['audio_samples'])

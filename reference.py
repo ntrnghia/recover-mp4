@@ -32,7 +32,10 @@ def parse_reference(path):
         if not moov_data:
             raise ValueError("No moov atom in reference file")
 
-    return _parse_moov(moov_data)
+        info = _parse_moov(moov_data)
+        _extract_aac_header_patterns(f, moov_data, info)
+
+    return info
 
 
 def _parse_moov(moov):
@@ -96,6 +99,26 @@ def _parse_moov(moov):
                 _, spc, _ = struct.unpack('>III', moov[stsc_off + 12:stsc_off + 24])
                 info['audio']['samples_per_chunk'] = spc
 
+        # Extract audio frame size stats from stsz
+        stsz_off = moov.find(b'stsz', soun_off)
+        if stsz_off >= 0:
+            uniform = struct.unpack('>I', moov[stsz_off + 8:stsz_off + 12])[0]
+            count = struct.unpack('>I', moov[stsz_off + 12:stsz_off + 16])[0]
+            if uniform > 0:
+                info['audio']['frame_size_min'] = uniform
+                info['audio']['frame_size_max'] = uniform
+                info['audio']['frame_size_mean'] = float(uniform)
+                info['audio']['frame_size_stdev'] = 0.0
+            elif count > 0 and stsz_off + 16 + count * 4 <= len(moov):
+                sizes = struct.unpack(f'>{count}I',
+                                      moov[stsz_off + 16:stsz_off + 16 + count * 4])
+                info['audio']['frame_size_min'] = min(sizes)
+                info['audio']['frame_size_max'] = max(sizes)
+                mean = sum(sizes) / len(sizes)
+                info['audio']['frame_size_mean'] = mean
+                variance = sum((s - mean) ** 2 for s in sizes) / len(sizes)
+                info['audio']['frame_size_stdev'] = variance ** 0.5
+
     # Defaults
     info['video'].setdefault('timescale', 30000)
     info['video'].setdefault('sample_delta', 1000)
@@ -106,6 +129,85 @@ def _parse_moov(moov):
     info['audio'].setdefault('samples_per_chunk', 15)
 
     return info
+
+
+def _extract_aac_header_patterns(f, moov, info):
+    """Extract dominant AAC header patterns from reference audio frames.
+
+    Reads the first 3 bytes of each audio frame to determine the most common
+    max_sfb (per window type) and ms_mask_present values. These are used by
+    the scanner to strongly prefer candidates matching the reference pattern.
+    """
+    soun_off = moov.find(b'soun')
+    if soun_off < 0:
+        return
+
+    # Get audio stsz sizes
+    stsz_off = moov.find(b'stsz', soun_off)
+    if stsz_off < 0:
+        return
+    uniform = struct.unpack('>I', moov[stsz_off + 8:stsz_off + 12])[0]
+    count = struct.unpack('>I', moov[stsz_off + 12:stsz_off + 16])[0]
+    if count == 0:
+        return
+    if uniform > 0:
+        sizes = [uniform] * count
+    elif stsz_off + 16 + count * 4 <= len(moov):
+        sizes = list(struct.unpack(f'>{count}I',
+                                   moov[stsz_off + 16:stsz_off + 16 + count * 4]))
+    else:
+        return
+
+    # Get audio stco offsets
+    stco_off = moov.find(b'stco', soun_off)
+    if stco_off < 0:
+        return
+    chunk_count = struct.unpack('>I', moov[stco_off + 8:stco_off + 12])[0]
+    if chunk_count == 0:
+        return
+    chunk_offsets = list(struct.unpack(
+        f'>{chunk_count}I',
+        moov[stco_off + 12:stco_off + 12 + chunk_count * 4]))
+
+    spc = info['audio'].get('samples_per_chunk', 15)
+
+    # Read first 3 bytes of each frame (batch-read per chunk)
+    msf_long_counts = {}
+    msf_short_counts = {}
+    ms_counts = {}
+    si = 0
+    for co in chunk_offsets:
+        n = min(spc, len(sizes) - si)
+        chunk_total = sum(sizes[si:si + n])
+        f.seek(co)
+        chunk_data = f.read(chunk_total)
+        off = 0
+        for j in range(n):
+            if off + 3 <= len(chunk_data):
+                b0, b1, b2 = chunk_data[off], chunk_data[off + 1], chunk_data[off + 2]
+                if b0 in (0x20, 0x21) and not (b1 & 0x80):
+                    ws = (b1 >> 5) & 0x03
+                    if ws == 2:
+                        msf = b1 & 0x0F
+                        msf_short_counts[msf] = msf_short_counts.get(msf, 0) + 1
+                    else:
+                        msf = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)
+                        msf_long_counts[msf] = msf_long_counts.get(msf, 0) + 1
+                    if b0 == 0x21 and ws != 2:
+                        ms = (b2 >> 3) & 0x03
+                        ms_counts[ms] = ms_counts.get(ms, 0) + 1
+            off += sizes[si]
+            si += 1
+
+    # Store the dominant values
+    if msf_long_counts:
+        info['audio']['dominant_msf_long'] = max(msf_long_counts,
+                                                  key=msf_long_counts.get)
+    if msf_short_counts:
+        info['audio']['dominant_msf_short'] = max(msf_short_counts,
+                                                   key=msf_short_counts.get)
+    if ms_counts:
+        info['audio']['dominant_ms'] = max(ms_counts, key=ms_counts.get)
 
 
 def _parse_avcc(data, info):
