@@ -1,4 +1,4 @@
-# recover_mp4
+# recover-mp4
 
 Recovers corrupted MP4 files missing the **moov atom** by scanning raw mdat data for H.264 NAL units and AAC audio, then rebuilding the MP4 index from scratch.
 
