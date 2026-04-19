@@ -13,11 +13,7 @@ Built for **Windows Snipping Tool** recordings but works with any MP4 using H.26
 ## Usage
 
 ```powershell
-# As module (recommended)
 python -m recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]
-
-# Via wrapper script
-python recover_mp4_v3.py <corrupted.mp4> <reference.mp4> [output.mp4]
 ```
 
 If `output.mp4` is omitted, writes to `<corrupted>_recovered.mp4`.
@@ -33,7 +29,7 @@ If `output.mp4` is omitted, writes to `<corrupted>_recovered.mp4`.
    - Everything between video chunks = audio → detects AAC frame boundaries via DP
 3. **Build moov** — constructs complete MP4 index (mvhd, trak, stbl tables) from scan results
 4. **Write output** — streams pre-mdat boxes + mdat + new moov
-5. **Fix audio** — ffmpeg re-encodes audio (video untouched) to fix imprecise AAC frame boundaries
+5. **Fix audio** — ffmpeg re-encodes audio (video untouched) with error tolerance and PTS correction to fix corrupt AAC frames; falls back to segment-based processing for heavily damaged sections
 
 ## Package Structure
 
