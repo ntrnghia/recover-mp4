@@ -1,6 +1,6 @@
 """mdat scanner — finds video and audio samples in corrupted MP4 data.
 
-Scans interleaved video/audio data in a corrupted Screen Sketch MP4:
+Scans interleaved video/audio data in a corrupted Snipping Tool MP4:
   [ftyp][uuid][mdat: [8-byte preamble][V chunk][A chunk][V chunk][A chunk]...]
 
 Video chunks contain length-prefixed H.264 NAL units.

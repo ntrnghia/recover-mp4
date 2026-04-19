@@ -2,7 +2,7 @@
 
 Recovers corrupted MP4 files missing the **moov atom** by scanning raw mdat data for H.264 NAL units and AAC audio, then rebuilding the MP4 index from scratch.
 
-Built for **Windows Screen Sketch** recordings but works with any MP4 using H.264 + AAC-LC interleaved as `[V chunk][A chunk][V chunk][A chunk]...`.
+Built for **Windows Snipping Tool** recordings but works with any MP4 using H.264 + AAC-LC interleaved as `[V chunk][A chunk][V chunk][A chunk]...`.
 
 ## Requirements
 
@@ -75,7 +75,7 @@ Where n = frames per chunk (~15), c = candidates (capped at 500).
 
 ## Reference File Requirements
 
-- Same **app** (e.g., Windows Screen Sketch)
+- Same **app** (e.g., Windows Snipping Tool)
 - Same **resolution** and **frame rate**
 - Same **codec** (H.264 + AAC)
 - **Not corrupted** (plays normally)

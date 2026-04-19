@@ -1,4 +1,4 @@
-"""MP4 Recovery Tool for Windows Screen Sketch recordings.
+"""MP4 Recovery Tool for Windows Snipping Tool recordings.
 
 Recovers corrupted MP4 files missing the moov atom by scanning the mdat
 for H.264 NAL units and AAC audio, then rebuilding the index.
