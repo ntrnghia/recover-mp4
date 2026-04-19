@@ -4,16 +4,42 @@ Recovers corrupted MP4 files missing the **moov atom** by scanning raw mdat data
 
 Built for **Windows Snipping Tool** recordings but works with any MP4 using H.264 + AAC-LC interleaved as `[V chunk][A chunk][V chunk][A chunk]...`.
 
+Available in **Python** and **C++** — both produce identical output.
+
 ## Requirements
+
+### Python
 
 - **Python 3.10+** (no external packages — stdlib only)
 - **FFmpeg** in PATH (for audio fix step)
 - A **working reference MP4** from the same app/settings
 
+### C++ 
+
+- **C++26** compiler (GCC 15+, Clang 18+)
+- **CMake 3.25+**
+- **FFmpeg** development libraries (`libavformat`, `libavcodec`, `libavutil`) + `ffmpeg` CLI in PATH
+- **pkg-config**
+
 ## Usage
+
+### Python
 
 ```powershell
 python -m recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]
+```
+
+### C++
+
+```bash
+# Build
+cd cpp
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+
+# Run
+./recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]
 ```
 
 If `output.mp4` is omitted, writes to `<corrupted>_recovered.mp4`.
@@ -38,18 +64,28 @@ If `output.mp4` is omitted, writes to `<corrupted>_recovered.mp4`.
    - Crash-prone segments → replaced with silence
    - Concatenates all segments and muxes with original video
 
-## Package Structure
+## Project Structure
 
 ```
 recover_mp4/
 ├── __init__.py      # Package marker
-├── __main__.py      # CLI entry point
+├── __main__.py      # CLI entry point (Python)
 ├── constants.py     # AUD_PATTERN, VALID_NAL_MASK, parse_slice_type
 ├── reference.py     # Reference MP4 parser (SPS/PPS, timescales, AAC patterns)
 ├── scanner.py       # mdat scanner (video/audio sample detection)
 ├── atoms.py         # MP4 atom builders (moov, trak, stbl boxes)
 ├── writer.py        # Output writer + ffmpeg hybrid audio fixer
-└── README.md        # This file
+├── cpp/             # C++ implementation (identical algorithm)
+│   ├── CMakeLists.txt
+│   └── src/
+│       ├── main.cpp
+│       ├── constants.hpp
+│       ├── reference.hpp / .cpp
+│       ├── scanner.hpp / .cpp
+│       ├── atoms.hpp / .cpp
+│       ├── writer.hpp / .cpp
+│       └── mmap_file.hpp   # Cross-platform memory-mapped I/O
+└── README.md
 ```
 
 ## Key Optimizations
@@ -67,6 +103,15 @@ recover_mp4/
 | Precomputed DP cost terms (`inv_scale`, `scaled_scores`) | `scanner.py` | Eliminates division and multiplication per DP iteration |
 | Batch chunk reads for AAC pattern extraction | `reference.py` | Single read per chunk vs per-frame seek |
 | Extract audio once + parallel segment processing | `writer.py` | Avoids 1000+ seeks into large file; 8-thread parallel test/fix |
+
+### C++ Specific
+
+| Optimization | Location | Impact |
+|---|---|---|
+| Memory-mapped file I/O | `mmap_file.hpp` | Zero-copy access to multi-GB files (Windows + POSIX) |
+| Direct binary parsing (no struct overhead) | `reference.cpp` | Reads moov atoms directly from mapped memory |
+| `std::async` parallel segment processing | `writer.cpp` | Parallel ffmpeg subprocess execution for audio fix |
+| Cross-platform subprocess via `std::system` | `writer.cpp` | Works on both Windows and Linux/WSL |
 
 ## AAC Boundary Detection
 
