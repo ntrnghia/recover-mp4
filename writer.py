@@ -65,7 +65,7 @@ def fix_audio(output_path):
          '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
          '-i', output_path,
          '-c:v', 'copy', '-c:a', 'aac', '-b:a', '192k',
-         '-af', 'aresample=async=1', tmp],
+         '-af', 'asetpts=N/SR/TB', tmp],
         capture_output=True, text=True, timeout=7200)
     if result.returncode == 0:
         os.replace(tmp, output_path)
@@ -113,7 +113,7 @@ def fix_audio(output_path):
              '-err_detect', 'ignore_err', '-fflags', '+genpts+discardcorrupt',
              '-i', output_path,
              '-vn', '-c:a', 'aac', '-b:a', '192k',
-             '-af', 'aresample=async=1', audio_fixed],
+             '-af', 'asetpts=N/SR/TB', audio_fixed],
             capture_output=True, text=True, timeout=7200)
 
         if r.returncode != 0:
@@ -131,7 +131,7 @@ def fix_audio(output_path):
                      '-fflags', '+genpts+discardcorrupt',
                      '-ss', f'{ss:.3f}', '-t', f'{dur:.3f}',
                      '-i', output_path, '-vn', '-c:a', 'aac', '-b:a', '192k',
-                     '-af', 'aresample=async=1', path],
+                     '-af', 'asetpts=N/SR/TB', path],
                     capture_output=True, text=True, timeout=600)
                 return r.returncode == 0
 
