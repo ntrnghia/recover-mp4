@@ -54,16 +54,21 @@ def fix_audio(output_path):
         return False
 
     # Check if audio decodes cleanly (lossless path)
+    import time as _time
+    print("  Validating audio stream...", end='', flush=True)
+    t_chk = _time.perf_counter()
     r = subprocess.run(
         [ffmpeg, '-v', 'error', '-i', output_path, '-vn', '-f', 'null', '-'],
         capture_output=True, text=True, timeout=600)
     aac_errors = [l for l in (r.stderr or '').split('\n')
                   if l.strip() and 'aac' in l.lower()]
+    chk_elapsed = _time.perf_counter() - t_chk
     if not aac_errors:
-        print("  Audio is clean (lossless).")
+        print(f" clean. ({chk_elapsed:.1f}s)")
         return True
 
-    print(f"  {len(aac_errors)} AAC errors found, re-encoding audio...")
+    print(f" {len(aac_errors)} AAC errors. ({chk_elapsed:.1f}s)")
+    print(f"  Re-encoding audio...")
     return _fix_audio_reencode(output_path, ffmpeg)
 
 
@@ -170,6 +175,9 @@ def _fix_audio_reencode(output_path, ffmpeg):
         # Phase 3: Re-encode bad segments in parallel
         reencoded = 0
         silent = 0
+        if bad_indices:
+            print(f"\n  Re-encoding {len(bad_indices)} bad segments...",
+                  end='', flush=True)
 
         def fix_seg(i):
             """Re-encode a bad segment; fall back to silence on failure."""
@@ -202,6 +210,7 @@ def _fix_audio_reencode(output_path, ffmpeg):
             return 'silent'
 
         if bad_indices:
+            t_fix = _time.perf_counter()
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = {pool.submit(fix_seg, i): i for i in bad_indices}
                 for future in as_completed(futures):
@@ -210,6 +219,8 @@ def _fix_audio_reencode(output_path, ffmpeg):
                         reencoded += 1
                     else:
                         silent += 1
+            fix_elapsed = _time.perf_counter() - t_fix
+            print(f" done. ({fix_elapsed:.1f}s)")
 
         lossless = total_segs - len(bad_indices)
         print(f"\r  Segments: {lossless}/{total_segs} lossless, "

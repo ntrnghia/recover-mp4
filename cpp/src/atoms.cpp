@@ -39,6 +39,13 @@ inline void append_be16(std::vector<uint8_t>& out, uint16_t v) {
     out.insert(out.end(), buf, buf + 2);
 }
 
+/// Append a BE64 value.
+inline void append_be64(std::vector<uint8_t>& out, uint64_t v) {
+    uint8_t buf[8];
+    write_be64(buf, v);
+    out.insert(out.end(), buf, buf + 8);
+}
+
 /// Append a single byte.
 inline void append_byte(std::vector<uint8_t>& out, uint8_t v) {
     out.push_back(v);
@@ -69,12 +76,20 @@ size_t begin_full_box(std::vector<uint8_t>& out, const char* type,
 
 // ─── Track-level boxes ──────────────────────────────────────────────────────
 
-void write_mvhd(std::vector<uint8_t>& out, uint32_t timescale, uint32_t duration) {
-    size_t start = begin_full_box(out, "mvhd", 0, 0);
-    append_be32(out, 0); // creation_time
-    append_be32(out, 0); // modification_time
-    append_be32(out, timescale);
-    append_be32(out, duration);
+void write_mvhd(std::vector<uint8_t>& out, uint32_t timescale, uint64_t duration) {
+    uint8_t version = (duration > 0xFFFFFFFFu) ? 1 : 0;
+    size_t start = begin_full_box(out, "mvhd", version, 0);
+    if (version == 1) {
+        append_be64(out, 0); // creation_time
+        append_be64(out, 0); // modification_time
+        append_be32(out, timescale);
+        append_be64(out, duration);
+    } else {
+        append_be32(out, 0);
+        append_be32(out, 0);
+        append_be32(out, timescale);
+        append_be32(out, static_cast<uint32_t>(duration));
+    }
     append_be32(out, 0x00010000); // rate = 1.0
     append_be16(out, 0x0100);    // volume = 1.0
     append_zeros(out, 10);       // reserved
@@ -86,14 +101,23 @@ void write_mvhd(std::vector<uint8_t>& out, uint32_t timescale, uint32_t duration
     end_box(out, start);
 }
 
-void write_tkhd(std::vector<uint8_t>& out, uint32_t track_id, uint32_t duration,
+void write_tkhd(std::vector<uint8_t>& out, uint32_t track_id, uint64_t duration,
                 uint16_t width, uint16_t height, bool is_audio) {
-    size_t start = begin_full_box(out, "tkhd", 0, 3);
-    append_be32(out, 0); // creation_time
-    append_be32(out, 0); // modification_time
-    append_be32(out, track_id);
-    append_zeros(out, 4); // reserved
-    append_be32(out, duration);
+    uint8_t version = (duration > 0xFFFFFFFFu) ? 1 : 0;
+    size_t start = begin_full_box(out, "tkhd", version, 3);
+    if (version == 1) {
+        append_be64(out, 0); // creation_time
+        append_be64(out, 0); // modification_time
+        append_be32(out, track_id);
+        append_zeros(out, 4); // reserved
+        append_be64(out, duration);
+    } else {
+        append_be32(out, 0);
+        append_be32(out, 0);
+        append_be32(out, track_id);
+        append_zeros(out, 4);
+        append_be32(out, static_cast<uint32_t>(duration));
+    }
     append_zeros(out, 8); // reserved
     append_be16(out, 0);  // layer
     append_be16(out, 0);  // alternate_group
@@ -417,11 +441,10 @@ std::vector<uint8_t> build_moov(const ReferenceInfo& ref, const ScanResult& scan
 
     uint32_t v_media_dur = static_cast<uint32_t>(vs.size()) * v_delta;
     uint32_t a_media_dur = static_cast<uint32_t>(as.size()) * a_delta;
-    uint32_t v_tkhd_dur = static_cast<uint32_t>(
-        static_cast<uint64_t>(v_media_dur) * mvhd_ts / v_ts);
-    uint32_t a_tkhd_dur = as.empty() ? 0 : static_cast<uint32_t>(
-        static_cast<uint64_t>(a_media_dur) * mvhd_ts / a_ts);
-    uint32_t mvhd_dur = std::max(v_tkhd_dur, a_tkhd_dur);
+    uint64_t v_tkhd_dur = static_cast<uint64_t>(v_media_dur) * mvhd_ts / v_ts;
+    uint64_t a_tkhd_dur = as.empty() ? 0 :
+        static_cast<uint64_t>(a_media_dur) * mvhd_ts / a_ts;
+    uint64_t mvhd_dur = std::max(v_tkhd_dur, a_tkhd_dur);
 
     // Determine if we need co64
     uint64_t max_offset = 0;

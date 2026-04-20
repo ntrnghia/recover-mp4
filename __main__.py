@@ -4,7 +4,10 @@ Recovers corrupted MP4 files missing the moov atom by scanning the mdat
 for H.264 NAL units and AAC audio, then rebuilding the index.
 
 Usage:
-    python -m recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]
+    python -m recover_mp4 <corrupted.mp4> [reference.mp4] [output.mp4]
+
+When no reference is provided, codec config is auto-detected from the
+encoder SEI embedded in the corrupted file's mdat.
 
 No external dependencies — uses only Python stdlib (+ ffmpeg for audio fix).
 """
@@ -12,30 +15,48 @@ No external dependencies — uses only Python stdlib (+ ffmpeg for audio fix).
 import os
 import sys
 
-from .reference import parse_reference
+from .reference import parse_reference, detect_config
 from .scanner import scan_mdat
 from .atoms import build_moov
 from .writer import write_output, fix_audio
 
 
 def main():
-    if len(sys.argv) < 3:
-        print("Usage: python -m recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]")
+    if len(sys.argv) < 2:
+        print("Usage: python -m recover_mp4 <corrupted.mp4> [reference.mp4] [output.mp4]")
         sys.exit(1)
 
     corrupted = sys.argv[1]
-    reference = sys.argv[2]
-    output = sys.argv[3] if len(sys.argv) > 3 else corrupted.rsplit('.', 1)[0] + '_recovered.mp4'
+
+    # Determine if second arg is a reference file or output path
+    reference = None
+    output = None
+    if len(sys.argv) >= 3:
+        arg2 = sys.argv[2]
+        if arg2.endswith('.mp4') and os.path.exists(arg2) and len(sys.argv) >= 4:
+            # 3 args: corrupted reference output
+            reference = arg2
+            output = sys.argv[3]
+        elif arg2.endswith('.mp4') and os.path.exists(arg2):
+            # Could be reference or output — check if it has moov
+            reference = arg2
+        else:
+            output = arg2
+
+    if output is None:
+        output = corrupted.rsplit('.', 1)[0] + '_recovered.mp4'
 
     if not os.path.exists(corrupted):
         print(f"Error: {corrupted} not found")
         sys.exit(1)
-    if not os.path.exists(reference):
-        print(f"Error: {reference} not found")
-        sys.exit(1)
 
-    print("[1/5] Parsing reference file...")
-    ref = parse_reference(reference)
+    if reference:
+        print("[1/5] Parsing reference file...")
+        ref = parse_reference(reference)
+    else:
+        print("[1/5] Auto-detecting codec config from corrupted file...")
+        ref = detect_config(corrupted)
+
     print(f"  Video: {ref['video']['width']}x{ref['video']['height']}")
     sps = ref['video'].get('sps', b'')
     pps = ref['video'].get('pps', b'')
@@ -55,8 +76,13 @@ def main():
     moov = build_moov(ref, scan)
     print(f"  moov size: {len(moov):,} bytes")
 
-    print("\n[4/5] Writing output file...")
+    print("\n[4/5] Writing output file...", end='', flush=True)
+    import time as _time
+    t_write = _time.perf_counter()
     write_output(corrupted, output, scan, moov)
+    w_elapsed = _time.perf_counter() - t_write
+    size_mb = os.path.getsize(output) / 1024 / 1024
+    print(f" {size_mb:.0f} MB written. ({w_elapsed:.1f}s)")
 
     print("\n[5/5] Fixing audio...")
     fix_audio(output)

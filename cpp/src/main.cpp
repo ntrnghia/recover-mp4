@@ -4,30 +4,43 @@
 /// for H.264 NAL units and AAC audio, then rebuilding the index.
 ///
 /// Usage:
-///     recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]
+///     recover_mp4 <corrupted.mp4> [reference.mp4] [output.mp4]
 
 #include "reference.hpp"
 #include "scanner.hpp"
 #include "atoms.hpp"
 #include "writer.hpp"
 
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <print>
 #include <string>
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        std::println("Usage: recover_mp4 <corrupted.mp4> <reference.mp4> [output.mp4]");
+    if (argc < 2) {
+        std::println("Usage: recover_mp4 <corrupted.mp4> [reference.mp4] [output.mp4]");
         return 1;
     }
 
     std::string corrupted = argv[1];
-    std::string reference = argv[2];
+    std::string reference;
     std::string output;
-    if (argc > 3) {
-        output = argv[3];
-    } else {
+
+    // Determine if second arg is reference or output
+    if (argc >= 3) {
+        std::string arg2 = argv[2];
+        if (argc >= 4) {
+            reference = arg2;
+            output = argv[3];
+        } else if (std::filesystem::exists(arg2) && arg2.ends_with(".mp4")) {
+            reference = arg2;
+        } else {
+            output = arg2;
+        }
+    }
+
+    if (output.empty()) {
         auto p = std::filesystem::path(corrupted);
         output = (p.parent_path() / (p.stem().string() + "_recovered.mp4")).string();
     }
@@ -36,14 +49,16 @@ int main(int argc, char* argv[]) {
         std::println("Error: {} not found", corrupted);
         return 1;
     }
-    if (!std::filesystem::exists(reference)) {
-        std::println("Error: {} not found", reference);
-        return 1;
-    }
 
     try {
-        std::println("[1/5] Parsing reference file...");
-        auto ref = recover::parse_reference(reference);
+        recover::ReferenceInfo ref;
+        if (!reference.empty()) {
+            std::println("[1/5] Parsing reference file...");
+            ref = recover::parse_reference(reference);
+        } else {
+            std::println("[1/5] Auto-detecting codec config from corrupted file...");
+            ref = recover::detect_config(corrupted);
+        }
         std::println("  Video: {}x{}", ref.width, ref.height);
         std::println("  SPS: {} bytes, PPS: {} bytes", ref.sps.size(), ref.pps.size());
         double fps = static_cast<double>(ref.video_timescale) / ref.video_sample_delta;
@@ -60,10 +75,16 @@ int main(int argc, char* argv[]) {
         auto moov = recover::build_moov(ref, scan);
         std::println("  moov size: {:L} bytes", moov.size());
 
-        std::println("\n[4/5] Writing output file...");
+        std::print("\n[4/5] Writing output file...");
+        std::fflush(stdout);
+        auto t_write = std::chrono::steady_clock::now();
         recover::write_output(corrupted, output, scan, moov);
+        double w_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_write).count();
+        auto file_size = std::filesystem::file_size(output);
+        std::println(" {} MB written. ({:.1f}s)", file_size / (1024 * 1024), w_elapsed);
 
-        std::println("\n[5/5] Fixing audio (FFmpeg re-encode)...");
+        std::println("\n[5/5] Fixing audio...");
         bool ok = recover::fix_audio(output);
         if (ok) {
             std::println("  Audio fixed successfully.");

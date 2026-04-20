@@ -23,6 +23,14 @@ def build_full_box(box_type, version, flags, content):
 # ─── Track-level boxes ───────────────────────────────────────────────────────
 
 def build_mvhd(timescale, duration):
+    if duration > 0xFFFFFFFF:
+        data = struct.pack(
+            '>QQIQ', 0, 0, timescale, duration
+        ) + struct.pack('>I', 0x00010000) + struct.pack(
+            '>H', 0x0100) + b'\x00' * 10 + struct.pack(
+            '>9I', 0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000
+        ) + b'\x00' * 24 + struct.pack('>I', 3)
+        return build_full_box(b'mvhd', 1, 0, data)
     data = struct.pack(
         '>IIIII', 0, 0, timescale, duration, 0x00010000  # rate 1.0
     ) + struct.pack('>H', 0x0100) + b'\x00' * 10 + struct.pack(
@@ -32,6 +40,18 @@ def build_mvhd(timescale, duration):
 
 
 def build_tkhd(track_id, duration, width, height, is_audio):
+    if duration > 0xFFFFFFFF:
+        data = b''.join([
+            struct.pack('>QQI', 0, 0, track_id),
+            b'\x00' * 4,                                    # reserved
+            struct.pack('>Q', duration),
+            b'\x00' * 8,                                    # reserved
+            struct.pack('>HHH', 0, 0, 0x0100 if is_audio else 0),
+            b'\x00' * 2,
+            struct.pack('>9I', 0x00010000, 0, 0, 0, 0x00010000, 0, 0, 0, 0x40000000),
+            struct.pack('>II', width << 16, height << 16),
+        ])
+        return build_full_box(b'tkhd', 1, 3, data)
     data = b''.join([
         struct.pack('>III', 0, 0, track_id),
         b'\x00' * 4,                                    # reserved

@@ -91,9 +91,11 @@ int run_ffmpeg(const std::vector<std::string>& args, std::string* captured_stder
     // Redirect stderr to a temp file if we need to capture it
     std::string stderr_file;
     if (captured_stderr) {
+        static std::atomic<uint64_t> stderr_counter{0};
         auto tmp = std::filesystem::temp_directory_path() /
-                   std::format("ffmpeg_err_{}.txt",
-                               std::chrono::steady_clock::now().time_since_epoch().count());
+                   std::format("ffmpeg_err_{}_{}.txt",
+                               std::this_thread::get_id(),
+                               stderr_counter.fetch_add(1, std::memory_order_relaxed));
         stderr_file = tmp.string();
         cmd += " 2>\"" + stderr_file + "\"";
     } else {
@@ -192,15 +194,21 @@ bool fix_audio(const std::string& output_path) {
     }
 
     // Check if audio decodes cleanly
+    std::print("  Validating audio stream...");
+    std::fflush(stdout);
+    auto t_chk = std::chrono::steady_clock::now();
     std::string stderr_out;
     run_ffmpeg({"ffmpeg", "-v", "error", "-i", output_path, "-vn", "-f", "null", "-"},
                &stderr_out);
     int aac_errors = count_aac_errors(stderr_out);
+    double chk_elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t_chk).count();
     if (aac_errors == 0) {
-        std::println("  Audio is clean (lossless).");
+        std::println(" clean. ({:.1f}s)", chk_elapsed);
         return true;
     }
-    std::println("  {} AAC errors found, re-encoding audio...", aac_errors);
+    std::println(" {} AAC errors. ({:.1f}s)", aac_errors, chk_elapsed);
+    std::println("  Re-encoding audio...");
 
     // ── Hybrid parallel audio fix ──
     auto t0 = std::chrono::steady_clock::now();
@@ -322,6 +330,9 @@ bool fix_audio(const std::string& output_path) {
     };
 
     if (!bad_indices.empty()) {
+        std::print("\n  Re-encoding {} bad segments...", bad_indices.size());
+        std::fflush(stdout);
+        auto t_fix = std::chrono::steady_clock::now();
         std::vector<std::future<void>> futures;
         for (int start = 0; start < static_cast<int>(bad_indices.size()); start += workers) {
             int batch_end = std::min(start + workers, static_cast<int>(bad_indices.size()));
@@ -331,6 +342,9 @@ bool fix_audio(const std::string& output_path) {
             }
             for (auto& f : futures) f.get();
         }
+        double fix_elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_fix).count();
+        std::println(" done. ({:.1f}s)", fix_elapsed);
     }
 
     int lossless = total_segs - static_cast<int>(bad_indices.size());

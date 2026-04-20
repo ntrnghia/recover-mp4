@@ -46,4 +46,8 @@ struct ReferenceInfo {
 /// Uses FFmpeg's libavformat for robust parsing.
 ReferenceInfo parse_reference(const std::string& path);
 
+/// Auto-detect codec config from a corrupted file's mdat (no reference needed).
+/// Parses the encoder SEI embedded by Microsoft H.264 Encoder V1.5.3.
+ReferenceInfo detect_config(const std::string& path);
+
 } // namespace recover

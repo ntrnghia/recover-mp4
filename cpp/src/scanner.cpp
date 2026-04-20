@@ -17,6 +17,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <print>
 
@@ -87,6 +88,9 @@ const uint8_t* find_next_video(const uint8_t* start, const uint8_t* end,
 
 /// DP partition solver with quality-weighted cost.
 /// Returns boundary positions or empty on failure.
+/// Noinline: prevents GCC 15 false-positive -Wfree-nonheap-object from
+/// over-aggressive inlining through find_aac_boundaries → create_audio_chunk.
+[[gnu::noinline]]
 std::vector<uint32_t> dp_solve(const std::vector<int>& candidates,
                                 const std::vector<double>& scaled_scores,
                                 int num_frames, uint32_t chunk_size,
@@ -396,10 +400,80 @@ void create_audio_chunk(const uint8_t* data, uint64_t start, uint64_t end,
     audio_chunks.push_back(std::move(chunk));
 }
 
+/// Bootstrap audio reference stats from equal-split samples.
+/// Reads the first 3 bytes of each frame to extract dominant header patterns.
+void bootstrap_audio_ref(const uint8_t* file_data,
+                          const std::vector<Sample>& audio_samples,
+                          AudioRef& audio_ref) {
+    if (audio_samples.empty()) return;
+
+    // Frame size stats
+    std::vector<double> sizes;
+    sizes.reserve(audio_samples.size());
+    for (const auto& s : audio_samples)
+        sizes.push_back(static_cast<double>(s.size));
+
+    double sum = 0;
+    for (double sz : sizes) sum += sz;
+    double mean = sum / sizes.size();
+    double var = 0;
+    for (double sz : sizes) var += (sz - mean) * (sz - mean);
+    var /= sizes.size();
+
+    double mn = *std::min_element(sizes.begin(), sizes.end());
+    double mx = *std::max_element(sizes.begin(), sizes.end());
+
+    audio_ref.frame_size_min = mn;
+    audio_ref.frame_size_max = mx;
+    audio_ref.frame_size_mean = mean;
+    audio_ref.frame_size_stdev = std::sqrt(var);
+
+    // Header pattern stats
+    std::map<int, int> msf_long_counts, msf_short_counts, ms_counts;
+
+    for (const auto& s : audio_samples) {
+        if (s.size < 3) continue;
+        const uint8_t* hdr = file_data + s.offset;
+        uint8_t b0 = hdr[0], b1 = hdr[1], b2 = hdr[2];
+
+        if (b0 != 0x20 && b0 != 0x21) continue;
+        if (b1 & 0x80) continue;  // ics_reserved_bit
+
+        int ws = (b1 >> 5) & 0x03;
+        if (ws == 2) {
+            int msf = b1 & 0x0F;
+            if (msf <= 14) msf_short_counts[msf]++;
+        } else {
+            int msf = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03);
+            if (msf <= 49 && !(b2 & 0x20))
+                msf_long_counts[msf]++;
+        }
+        if (b0 == 0x21 && ws != 2) {
+            int ms = (b2 >> 3) & 0x03;
+            if (ms != 3) ms_counts[ms]++;
+        }
+    }
+
+    auto max_key = [](const std::map<int, int>& m) -> int {
+        int best_k = 0, best_v = 0;
+        for (auto& [k, v] : m) {
+            if (v > best_v) { best_k = k; best_v = v; }
+        }
+        return best_k;
+    };
+
+    if (!msf_long_counts.empty())
+        audio_ref.dominant_msf_long = max_key(msf_long_counts);
+    if (!msf_short_counts.empty())
+        audio_ref.dominant_msf_short = max_key(msf_short_counts);
+    if (!ms_counts.empty())
+        audio_ref.dominant_ms = max_key(ms_counts);
+}
+
 } // anonymous namespace
 
 
-ScanResult scan_mdat(const std::string& corrupted_path, const ReferenceInfo& ref) {
+ScanResult scan_mdat(const std::string& corrupted_path, ReferenceInfo& ref) {
     MappedFile mf(corrupted_path);
     const uint8_t* file_data = mf.data();
     const uint64_t file_size = mf.size();
@@ -471,6 +545,10 @@ ScanResult scan_mdat(const std::string& corrupted_path, const ReferenceInfo& ref
 
     // Track per-chunk sample indices
     std::vector<uint32_t> chunk_sample_indices;
+
+    // Track whether bootstrap is needed (no reference stats)
+    bool needs_bootstrap = !ref.audio_ref.dominant_msf_long.has_value() &&
+                           ref.audio_ref.frame_size_mean <= 0;
 
     const uint8_t* p = file_data + data_start;
     std::println("  Scanning mdat for video/audio samples...");
@@ -563,6 +641,26 @@ ScanResult scan_mdat(const std::string& corrupted_path, const ReferenceInfo& ref
             create_audio_chunk(file_data, audio_start, next_video_offset, spc,
                                result.audio_samples, result.audio_chunks,
                                ref.audio_ref);
+        }
+
+        // Bootstrap audio stats from first chunks (reference-free mode)
+        if (needs_bootstrap && result.audio_chunks.size() >= 10) {
+            bootstrap_audio_ref(file_data, result.audio_samples, ref.audio_ref);
+            // Re-process first chunks with proper stats
+            std::vector<std::pair<uint64_t, uint64_t>> chunk_regions;
+            for (const auto& ch : result.audio_chunks) {
+                auto& s0 = result.audio_samples[ch.sample_indices.front()];
+                auto& sN = result.audio_samples[ch.sample_indices.back()];
+                chunk_regions.emplace_back(s0.offset, sN.offset + sN.size);
+            }
+            result.audio_samples.clear();
+            result.audio_chunks.clear();
+            for (auto [cstart, cend] : chunk_regions) {
+                create_audio_chunk(file_data, cstart, cend, spc,
+                                   result.audio_samples, result.audio_chunks,
+                                   ref.audio_ref);
+            }
+            needs_bootstrap = false;
         }
 
         p = next_video;

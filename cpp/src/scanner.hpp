@@ -35,6 +35,6 @@ struct ScanResult {
 };
 
 /// Scan corrupted mdat for interleaved video and audio data.
-ScanResult scan_mdat(const std::string& corrupted_path, const ReferenceInfo& ref);
+ScanResult scan_mdat(const std::string& corrupted_path, ReferenceInfo& ref);
 
 } // namespace recover

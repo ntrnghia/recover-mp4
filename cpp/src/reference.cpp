@@ -12,9 +12,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <map>
+#include <optional>
 #include <print>
 #include <stdexcept>
+#include <string_view>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -340,6 +343,330 @@ ReferenceInfo parse_reference(const std::string& path) {
         // Non-critical — defaults are fine
     }
 
+    return info;
+}
+
+// ─── Reference-free mode ────────────────────────────────────────────────────
+
+namespace {
+
+/// Bitstream writer for constructing H.264 NAL units.
+class BitWriter {
+    std::vector<uint8_t> data_;
+    uint8_t byte_ = 0;
+    int bit_pos_ = 7;
+
+public:
+    void write_u(uint32_t val, int n) {
+        for (int i = n - 1; i >= 0; --i) {
+            byte_ |= static_cast<uint8_t>(((val >> i) & 1) << bit_pos_);
+            if (--bit_pos_ < 0) {
+                data_.push_back(byte_);
+                byte_ = 0;
+                bit_pos_ = 7;
+            }
+        }
+    }
+
+    void write_ue(uint32_t val) {
+        val += 1;
+        int nbits = 0;
+        for (uint32_t v = val; v; v >>= 1) ++nbits;
+        write_u(0, nbits - 1);
+        write_u(val, nbits);
+    }
+
+    std::vector<uint8_t> flush() {
+        if (bit_pos_ < 7) {
+            byte_ |= static_cast<uint8_t>(1 << bit_pos_);
+            data_.push_back(byte_);
+        }
+        return data_;
+    }
+};
+
+/// Insert emulation prevention bytes (0x03) per H.264 spec.
+std::vector<uint8_t> add_emulation_prevention(const std::vector<uint8_t>& rbsp) {
+    std::vector<uint8_t> out;
+    out.reserve(rbsp.size() + rbsp.size() / 64);
+    int count = 0;
+    for (uint8_t b : rbsp) {
+        if (count >= 2 && b <= 3) {
+            out.push_back(3);
+            count = 0;
+        }
+        out.push_back(b);
+        count = (b == 0) ? count + 1 : 0;
+    }
+    return out;
+}
+
+/// Construct SPS NAL for Microsoft H.264 Encoder V1.5.3.
+std::vector<uint8_t> build_sps(int w, int h, bool cabac) {
+    int ref = cabac ? 1 : 2;
+
+    BitWriter bw;
+
+    // NAL header
+    bw.write_u(0, 1);   // forbidden_zero_bit
+    bw.write_u(3, 2);   // nal_ref_idc = 3
+    bw.write_u(7, 5);   // nal_unit_type = 7 (SPS)
+
+    bw.write_u(77, 8);  // profile_idc = Main
+    bw.write_u(0, 1);   // constraint_set0
+    bw.write_u(1, 1);   // constraint_set1
+    bw.write_u(0, 1);   // constraint_set2
+    bw.write_u(0, 1);   // constraint_set3
+    bw.write_u(0, 4);   // reserved
+
+    int w_mbs = (w + 15) / 16;
+    int h_mbs = (h + 15) / 16;
+    int mb_count = w_mbs * h_mbs;
+    int level = (mb_count * 30 > 245760) ? 50 : 40;
+    bw.write_u(static_cast<uint32_t>(level), 8);
+
+    bw.write_ue(0);      // seq_parameter_set_id
+
+    bw.write_ue(4);      // log2_max_frame_num_minus4
+
+    if (cabac) {
+        bw.write_ue(2);  // pic_order_cnt_type = 2
+    } else {
+        bw.write_ue(0);  // pic_order_cnt_type = 0
+        bw.write_ue(4);  // log2_max_pic_order_cnt_lsb_minus4
+    }
+
+    bw.write_ue(static_cast<uint32_t>(ref));
+    bw.write_u(0, 1);    // gaps_in_frame_num_allowed
+
+    bw.write_ue(static_cast<uint32_t>(w_mbs - 1));
+    bw.write_ue(static_cast<uint32_t>(h_mbs - 1));
+
+    bw.write_u(1, 1);    // frame_mbs_only_flag
+    bw.write_u(1, 1);    // direct_8x8_inference_flag
+
+    // Cropping
+    int crop_right = w_mbs * 16 - w;
+    int crop_bottom = h_mbs * 16 - h;
+    if (crop_right > 0 || crop_bottom > 0) {
+        bw.write_u(1, 1);
+        bw.write_ue(0);
+        bw.write_ue(static_cast<uint32_t>(crop_right / 2));
+        bw.write_ue(0);
+        bw.write_ue(static_cast<uint32_t>(crop_bottom / 2));
+    } else {
+        bw.write_u(0, 1);
+    }
+
+    // VUI
+    bw.write_u(1, 1);    // vui_parameters_present
+    bw.write_u(1, 1);    // aspect_ratio_info_present
+    bw.write_u(1, 8);    // aspect_ratio_idc = 1 (square)
+    bw.write_u(0, 1);    // overscan_info_present
+    bw.write_u(0, 1);    // video_signal_type_present
+    bw.write_u(0, 1);    // chroma_loc_info_present
+    bw.write_u(1, 1);    // timing_info_present
+    if (cabac) {
+        bw.write_u(1000, 32);
+        bw.write_u(60000, 32);
+    } else {
+        bw.write_u(1, 32);
+        bw.write_u(60, 32);
+    }
+    bw.write_u(0, 1);    // fixed_frame_rate_flag
+    bw.write_u(0, 1);    // nal_hrd_parameters_present
+    bw.write_u(0, 1);    // vcl_hrd_parameters_present
+    bw.write_u(0, 1);    // pic_struct_present
+    bw.write_u(1, 1);    // bitstream_restriction_flag
+    bw.write_u(1, 1);    // motion_vectors_over_pic_boundaries
+    if (cabac) {
+        bw.write_ue(0);   // max_bytes_per_pic_denom
+        bw.write_ue(0);   // max_bits_per_mb_denom
+        bw.write_ue(13);  // log2_max_mv_length_horizontal
+        bw.write_ue(9);   // log2_max_mv_length_vertical
+        bw.write_ue(0);   // max_num_reorder_frames
+        bw.write_ue(1);   // max_dec_frame_buffering
+    } else {
+        bw.write_ue(2);   // max_bytes_per_pic_denom
+        bw.write_ue(1);   // max_bits_per_mb_denom
+        bw.write_ue(16);  // log2_max_mv_length_horizontal
+        bw.write_ue(16);  // log2_max_mv_length_vertical
+        bw.write_ue(1);   // max_num_reorder_frames
+        bw.write_ue(2);   // max_dec_frame_buffering
+    }
+
+    auto rbsp = bw.flush();
+    return add_emulation_prevention(rbsp);
+}
+
+/// Return PPS NAL bytes for the given encoder variant.
+std::vector<uint8_t> build_pps(bool cabac) {
+    if (cabac) return {0x68, 0xEE, 0x3C, 0x80};
+    return {0x68, 0xCE, 0x3C, 0x80};
+}
+
+/// SEI parameter string parsed from mdat.
+struct SeiParams {
+    int w = 0;
+    int h = 0;
+    int cabac = 0;
+};
+
+/// Parse 'key:value' pairs from the encoder SEI parameter string.
+std::optional<SeiParams> parse_param_string(const char* text, size_t len) {
+    SeiParams p;
+    std::string_view sv(text, len);
+
+    auto get_val = [&](std::string_view key) -> std::optional<int> {
+        auto pos = sv.find(key);
+        if (pos == std::string_view::npos) return std::nullopt;
+        pos += key.size();
+        int val = 0;
+        while (pos < sv.size() && sv[pos] >= '0' && sv[pos] <= '9') {
+            val = val * 10 + (sv[pos] - '0');
+            ++pos;
+        }
+        return val;
+    };
+
+    auto w_val = get_val("w:");
+    auto h_val = get_val("h:");
+    if (!w_val || !h_val || *w_val == 0 || *h_val == 0) return std::nullopt;
+
+    p.w = *w_val;
+    p.h = *h_val;
+    p.cabac = get_val("cabac:").value_or(0);
+    return p;
+}
+
+/// Parse SEI NAL payloads looking for encoder parameter string.
+std::optional<SeiParams> parse_sei_payload(const uint8_t* data, size_t len) {
+    size_t pos = 0;
+    while (pos + 1 < len) {
+        // Payload type
+        uint32_t pt = 0;
+        while (pos < len && data[pos] == 0xFF) { pt += 255; ++pos; }
+        if (pos >= len) break;
+        pt += data[pos++];
+
+        // Payload size
+        uint32_t ps = 0;
+        while (pos < len && data[pos] == 0xFF) { ps += 255; ++pos; }
+        if (pos >= len) break;
+        ps += data[pos++];
+
+        if (pt == 5 && ps >= 20 && pos + ps <= len) {
+            // user_data_unregistered: 16-byte UUID + text
+            const char* text = reinterpret_cast<const char*>(data + pos + 16);
+            size_t text_len = ps - 16;
+            // Check for param string markers
+            auto sv = std::string_view(text, text_len);
+            if (sv.find("w:") != std::string_view::npos &&
+                sv.find("h:") != std::string_view::npos) {
+                return parse_param_string(text, text_len);
+            }
+        }
+        pos += ps;
+    }
+    return std::nullopt;
+}
+
+/// Parse SEI from the start of mdat data.
+std::optional<SeiParams> parse_sei_from_mdat(const uint8_t* data, size_t len) {
+    // Find AUD pattern
+    constexpr uint8_t aud[] = {0x00, 0x00, 0x00, 0x02, 0x09};
+    const uint8_t* aud_pos = nullptr;
+    for (size_t i = 0; i + 5 <= len; ++i) {
+        if (std::memcmp(data + i, aud, 5) == 0) {
+            aud_pos = data + i;
+            break;
+        }
+    }
+    if (!aud_pos) return std::nullopt;
+
+    size_t pos = static_cast<size_t>(aud_pos - data);
+    while (pos + 9 < len) {
+        uint32_t nal_len = read_be32(data + pos);
+        if (nal_len < 1 || nal_len > 4096 || pos + 4 + nal_len > len) break;
+        uint8_t nal_type = data[pos + 4] & 0x1F;
+
+        if (nal_type == 9) { // AUD — skip
+            pos += 4 + nal_len;
+            continue;
+        }
+        if (nal_type == 6) { // SEI
+            auto result = parse_sei_payload(data + pos + 5, nal_len - 1);
+            if (result) return result;
+            pos += 4 + nal_len;
+            continue;
+        }
+        break; // slice NAL — stop
+    }
+    return std::nullopt;
+}
+
+} // anonymous namespace
+
+ReferenceInfo detect_config(const std::string& path) {
+    // Read mdat header to find data start, then first 4KB
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("Cannot open file: " + path);
+
+    f.seekg(0, std::ios::end);
+    auto file_size = f.tellg();
+    f.seekg(0);
+
+    // Locate mdat atom
+    int64_t mdat_offset = -1;
+    while (f.tellg() < file_size) {
+        auto pos = f.tellg();
+        uint8_t hdr[16];
+        f.read(reinterpret_cast<char*>(hdr), 8);
+        if (!f) break;
+        uint64_t size = read_be32(hdr);
+        if (size == 1) {
+            f.read(reinterpret_cast<char*>(hdr + 8), 8);
+            if (!f) break;
+            size = read_be64(hdr + 8);
+        } else if (size == 0) {
+            size = static_cast<uint64_t>(file_size) - static_cast<uint64_t>(pos);
+        }
+        if (std::memcmp(hdr + 4, "mdat", 4) == 0) {
+            mdat_offset = pos;
+            break;
+        }
+        if (size < 8) break;
+        f.seekg(pos + static_cast<std::streamoff>(size));
+    }
+
+    if (mdat_offset < 0) throw std::runtime_error("No mdat atom found");
+
+    // Read first 4KB of mdat data
+    f.seekg(mdat_offset + 8);
+    uint8_t head[4096];
+    f.read(reinterpret_cast<char*>(head), sizeof(head));
+    auto bytes_read = f.gcount();
+
+    auto params = parse_sei_from_mdat(head, static_cast<size_t>(bytes_read));
+    if (!params) {
+        throw std::runtime_error(
+            "No encoder SEI found in mdat. Use a reference file or provide resolution.");
+    }
+
+    std::println("  SEI detected: {}x{}, cabac={}", params->w, params->h, params->cabac);
+
+    bool cabac = params->cabac != 0;
+    ReferenceInfo info;
+    info.width = static_cast<uint16_t>(params->w);
+    info.height = static_cast<uint16_t>(params->h);
+    info.video_timescale = 30000;
+    info.video_sample_delta = 1000;
+    info.audio_timescale = 48000;
+    info.audio_sample_delta = 1024;
+    info.samples_per_chunk = 15;
+    info.mvhd_timescale = 10'000'000;
+    info.sps = build_sps(params->w, params->h, cabac);
+    info.pps = build_pps(cabac);
     return info;
 }
 

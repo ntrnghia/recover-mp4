@@ -29,6 +29,8 @@ def scan_mdat(corrupted_path, ref_info):
     """
     audio_ref = ref_info['audio']
     spc = audio_ref['samples_per_chunk']
+    _needs_bootstrap = ('dominant_msf_long' not in audio_ref and
+                        'frame_size_mean' not in audio_ref)
 
     with open(corrupted_path, 'rb') as f:
         f.seek(0, 2)
@@ -177,6 +179,23 @@ def scan_mdat(corrupted_path, ref_info):
                 _create_audio_chunk(f, audio_start, next_video, spc,
                                     audio_samples, audio_chunks, audio_ref)
 
+            # Bootstrap audio stats from first chunks (reference-free mode)
+            if _needs_bootstrap and len(audio_chunks) >= 10:
+                _bootstrap_audio_ref(f, audio_samples, audio_chunks,
+                                     audio_ref, spc)
+                # Re-process first chunks with proper stats
+                chunk_regions = []
+                for _, si in audio_chunks:
+                    s0 = audio_samples[si[0]]
+                    sN = audio_samples[si[-1]]
+                    chunk_regions.append((s0[0], sN[0] + sN[1]))
+                audio_samples.clear()
+                audio_chunks.clear()
+                for cstart, cend in chunk_regions:
+                    _create_audio_chunk(f, cstart, cend, spc,
+                                        audio_samples, audio_chunks, audio_ref)
+                _needs_bootstrap = False
+
             pos = next_video
 
             if len(video_chunks) % 500 == 0:
@@ -290,6 +309,63 @@ def _find_next_video(f, start, end):
 
 
 # ─── Audio chunk detection ───────────────────────────────────────────────────
+
+
+def _bootstrap_audio_ref(f, audio_samples, audio_chunks, audio_ref, spc):
+    """Bootstrap audio reference stats from equal-split samples.
+
+    Reads the first 3 bytes of each audio frame from the first chunks to
+    extract dominant max_sfb and ms_mask patterns, plus frame size stats.
+    """
+    all_sizes = [s for _, s in audio_samples]
+    if not all_sizes:
+        return
+
+    # Frame size stats
+    mean = sum(all_sizes) / len(all_sizes)
+    variance = sum((s - mean) ** 2 for s in all_sizes) / len(all_sizes)
+    audio_ref['frame_size_min'] = min(all_sizes)
+    audio_ref['frame_size_max'] = max(all_sizes)
+    audio_ref['frame_size_mean'] = mean
+    audio_ref['frame_size_stdev'] = variance ** 0.5
+
+    # Read first 3 bytes of each frame for header pattern detection
+    msf_long_counts = {}
+    msf_short_counts = {}
+    ms_counts = {}
+
+    for offset, sz in audio_samples:
+        if sz < 3:
+            continue
+        f.seek(offset)
+        hdr = f.read(3)
+        if len(hdr) < 3:
+            continue
+        b0, b1, b2 = hdr[0], hdr[1], hdr[2]
+        if b0 not in (0x20, 0x21) or (b1 & 0x80):
+            continue
+        ws = (b1 >> 5) & 0x03
+        if ws == 2:
+            msf = b1 & 0x0F
+            if msf <= 14:
+                msf_short_counts[msf] = msf_short_counts.get(msf, 0) + 1
+        else:
+            msf = ((b1 & 0x0F) << 2) | ((b2 >> 6) & 0x03)
+            if msf <= 49 and not (b2 & 0x20):
+                msf_long_counts[msf] = msf_long_counts.get(msf, 0) + 1
+        if b0 == 0x21 and ws != 2:
+            ms = (b2 >> 3) & 0x03
+            if ms != 3:
+                ms_counts[ms] = ms_counts.get(ms, 0) + 1
+
+    if msf_long_counts:
+        audio_ref['dominant_msf_long'] = max(msf_long_counts,
+                                              key=msf_long_counts.get)
+    if msf_short_counts:
+        audio_ref['dominant_msf_short'] = max(msf_short_counts,
+                                               key=msf_short_counts.get)
+    if ms_counts:
+        audio_ref['dominant_ms'] = max(ms_counts, key=ms_counts.get)
 
 def _create_audio_chunk(f, start, end, samples_per_chunk,
                         audio_samples, audio_chunks, audio_ref=None):
