@@ -72,6 +72,20 @@ def main():
     print("\n[2/5] Scanning corrupted file...")
     scan = scan_mdat(corrupted, ref)
 
+    # Adjust chunk offsets if mdat header size changes in output.
+    # Original file may have 8-byte header (size=0), but >4GB mdat needs
+    # a 16-byte extended header in output — shifting all data offsets by +8.
+    import struct as _struct
+    with open(corrupted, 'rb') as _f:
+        _f.seek(scan['mdat_offset'])
+        _orig_hdr = 16 if _struct.unpack('>I', _f.read(4))[0] == 1 else 8
+    _new_hdr = 16 if scan['mdat_size'] > 0xFFFFFFFF else 8
+    _delta = _new_hdr - _orig_hdr
+    if _delta:
+        print(f"  mdat header: {_orig_hdr}B→{_new_hdr}B, adjusting chunk offsets by +{_delta}")
+        scan['video_chunks'] = [(o + _delta, s) for o, s in scan['video_chunks']]
+        scan['audio_chunks'] = [(o + _delta, s) for o, s in scan['audio_chunks']]
+
     print("\n[3/5] Building moov atom...")
     moov = build_moov(ref, scan)
     print(f"  moov size: {len(moov):,} bytes")

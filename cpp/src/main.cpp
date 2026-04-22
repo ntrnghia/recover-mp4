@@ -10,6 +10,8 @@
 #include "scanner.hpp"
 #include "atoms.hpp"
 #include "writer.hpp"
+#include "constants.hpp"
+#include "mmap_file.hpp"
 
 #include <chrono>
 #include <cstdlib>
@@ -70,6 +72,23 @@ int main(int argc, char* argv[]) {
 
         std::println("\n[2/5] Scanning corrupted file...");
         auto scan = recover::scan_mdat(corrupted, ref);
+
+        // Adjust chunk offsets if mdat header size changes in output.
+        // Original file may have 8-byte header (size=0), but >4GB mdat needs
+        // a 16-byte extended header in output — shifting all data offsets by +8.
+        {
+            recover::MappedFile probe(corrupted);
+            uint32_t orig_sf = recover::read_be32(probe.data() + scan.mdat_offset);
+            size_t orig_hdr = (orig_sf == 1) ? 16 : 8;
+            size_t new_hdr  = (scan.mdat_size > 0xFFFFFFFFull) ? 16 : 8;
+            int64_t delta   = static_cast<int64_t>(new_hdr) - static_cast<int64_t>(orig_hdr);
+            if (delta != 0) {
+                std::println("  mdat header: {}B\u2192{}B, adjusting chunk offsets by +{}",
+                             orig_hdr, new_hdr, delta);
+                for (auto& c : scan.video_chunks) c.offset += delta;
+                for (auto& c : scan.audio_chunks) c.offset += delta;
+            }
+        }
 
         std::println("\n[3/5] Building moov atom...");
         auto moov = recover::build_moov(ref, scan);

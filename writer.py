@@ -22,15 +22,16 @@ def write_output(corrupted_path, output_path, scan_info, moov):
         orig_size_field = struct.unpack('>I', src.read(4))[0]
         orig_hdr_size = 16 if orig_size_field == 1 else 8
 
-        # Write mdat with correct size header
+        # Write mdat with correct size header.
+        # data_bytes = actual payload bytes (mdat_size includes original header).
+        data_bytes = mdat_size - orig_hdr_size
         if mdat_size > 0xFFFFFFFF:
-            dst.write(struct.pack('>I4sQ', 1, b'mdat', mdat_size))
-            src.seek(mdat_offset + orig_hdr_size)
-            remaining = mdat_size - orig_hdr_size
+            # Extended 64-bit size: total box = 16-byte header + data_bytes.
+            dst.write(struct.pack('>I4sQ', 1, b'mdat', 16 + data_bytes))
         else:
-            dst.write(struct.pack('>I4s', mdat_size, b'mdat'))
-            src.seek(mdat_offset + orig_hdr_size)
-            remaining = mdat_size - orig_hdr_size
+            dst.write(struct.pack('>I4s', orig_hdr_size + data_bytes, b'mdat'))
+        src.seek(mdat_offset + orig_hdr_size)
+        remaining = data_bytes
 
         # Stream mdat content
         BUF = 4 * 1024 * 1024

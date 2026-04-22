@@ -44,25 +44,26 @@ void write_output(const std::string& corrupted_path, const std::string& output_p
     uint32_t orig_size_field = read_be32(data + scan.mdat_offset);
     size_t orig_hdr_size = (orig_size_field == 1) ? 16 : 8;
 
-    // Write mdat header
+    // Write mdat header.
+    // data_bytes = actual payload bytes (mdat_size includes the original header).
+    uint64_t data_bytes = scan.mdat_size - orig_hdr_size;
     if (scan.mdat_size > 0xFFFFFFFF) {
+        // Extended 64-bit size: total box = 16-byte header + data_bytes.
         uint8_t hdr[16];
         write_be32(hdr, 1);
         std::memcpy(hdr + 4, "mdat", 4);
-        write_be64(hdr + 8, scan.mdat_size);
+        write_be64(hdr + 8, 16 + data_bytes);
         dst.write(reinterpret_cast<const char*>(hdr), 16);
     } else {
         uint8_t hdr[8];
-        write_be32(hdr, static_cast<uint32_t>(scan.mdat_size));
+        write_be32(hdr, static_cast<uint32_t>(orig_hdr_size + data_bytes));
         std::memcpy(hdr + 4, "mdat", 4);
         dst.write(reinterpret_cast<const char*>(hdr), 8);
     }
 
     // Copy mdat content (skip original header)
     const uint8_t* mdat_content = data + scan.mdat_offset + orig_hdr_size;
-    size_t new_hdr_size = (scan.mdat_size > 0xFFFFFFFF) ? 16 : 8;
-    size_t remaining = static_cast<size_t>(scan.mdat_size - new_hdr_size);
-    dst.write(reinterpret_cast<const char*>(mdat_content), remaining);
+    dst.write(reinterpret_cast<const char*>(mdat_content), static_cast<std::streamsize>(data_bytes));
 
     // Append moov
     dst.write(reinterpret_cast<const char*>(moov.data()), moov.size());
