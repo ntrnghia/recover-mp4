@@ -41,19 +41,19 @@ Reference is optional. If omitted, codec config is auto-detected from the corrup
 
 ## How It Works
 
-1. **Detect config** — reads encoder SEI (type 5, user_data_unregistered) from mdat to get resolution, entropy mode, and reference frame count. Constructs SPS/PPS from these parameters. Falls back to a reference MP4 if provided.
+1. **Detect config** — if a reference MP4 is given, parses its moov for SPS/PPS and timescales. Otherwise reads the encoder SEI (type 5, user_data_unregistered) embedded in mdat to get resolution, entropy mode, and reference frame count, then constructs SPS/PPS from those parameters.
 2. **Scan mdat** — single O(n) pass:
    - Parses length-prefixed H.264 NALs, groups into access units via AUD delimiters
    - Detects IDR keyframes and B-frames via exp-Golomb slice header parsing
    - Invalid NAL → end of video chunk → searches for next AUD pattern
    - Gap between video chunks = audio → splits into AAC frames via quality-scored DP partitioning
 3. **Bootstrap audio stats** — after 10 chunks, analyzes equal-split frames to extract dominant AAC header patterns (max_sfb, ms_mask) and frame size statistics, then re-processes those chunks with proper boundary detection
-4. **Build moov** — constructs MP4 index (mvhd, trak, stbl) from scan results. Uses 64-bit boxes for recordings >24 min.
+4. **Build moov** — constructs MP4 index (mvhd, trak, stbl) from scan results. Uses 64-bit `mvhd`/`tkhd` durations for recordings longer than ~7 min and 64-bit chunk offsets (`co64`) for outputs larger than 4 GB.
 5. **Write output** — streams pre-mdat boxes + mdat + moov
 6. **Fix audio** — parallel hybrid approach:
-   - Extracts audio track, splits into 2s segments, tests each for AAC errors (8 threads)
+   - Extracts audio track, splits into 2s segments, tests each for any decode error (8 threads)
    - Clean → lossless copy. Corrupt → re-encode (AAC 192k). Failed → silence.
-   - Concatenates and muxes with original video
+   - Segments are written as raw ADTS (no container, no edit list) and binary-appended, then muxed with the original video
 
 ## AAC Boundary Detection
 
@@ -80,11 +80,11 @@ Two SPS/PPS variants exist, distinguished by `cabac` field in the SEI:
 | PPS bytes | `68 CE 3C 80` | `68 EE 3C 80` |
 
 Fixed parameters across all recordings:
-- Profile: Main (77), Level: 4.0 (≤1080p) or 5.0 (1440p+)
-- 30 fps, timescale 30000, sample delta 1000
-- Audio: AAC-LC, 48kHz stereo, ~192kbps CBR, 1024 samples/frame, 15 frames/chunk
+- Profile: Main (77), Level: 4.0 (≤1080p 30 fps) or 5.0 (1440p+)
+- 30 fps, video timescale 30000, sample delta 1000
+- Audio: AAC-LC, 48 kHz stereo, ~192 kbps CBR, 1024 samples/frame, 15 frames/chunk
 - Interleaving: strict V-A-V-A alternation
-- No B-frames, no inline SPS/PPS in mdat
+- No inline SPS/PPS in mdat (must be reconstructed from SEI or reference)
 
 ## Project Structure
 
