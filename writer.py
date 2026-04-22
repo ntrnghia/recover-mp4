@@ -137,7 +137,7 @@ def _fix_audio_reencode(output_path, ffmpeg):
         print(" done.")
 
         # Phase 2: Extract + test segments in parallel (from small audio file)
-        seg_files = [os.path.join(tmpdir, f'seg_{i:05d}.m4a')
+        seg_files = [os.path.join(tmpdir, f'seg_{i:05d}.aac')
                      for i in range(total_segs)]
 
         def extract_and_test(i):
@@ -148,15 +148,15 @@ def _fix_audio_reencode(output_path, ffmpeg):
             r = subprocess.run(
                 [ffmpeg, '-y', '-v', 'error',
                  '-ss', f'{ss:.3f}', '-t', f'{t:.3f}',
-                 '-i', full_audio, '-vn', '-c:a', 'copy', seg_path],
+                 '-i', full_audio, '-vn', '-c:a', 'copy',
+                 '-f', 'adts', seg_path],
                 capture_output=True, text=True, timeout=60)
             if r.returncode != 0 or not os.path.exists(seg_path):
                 return 'bad'
             r2 = subprocess.run(
                 [ffmpeg, '-v', 'error', '-i', seg_path, '-f', 'null', '-'],
                 capture_output=True, text=True, timeout=60)
-            errs = [l for l in (r2.stderr or '').split('\n')
-                    if l.strip() and 'aac' in l.lower()]
+            errs = [l for l in (r2.stderr or '').split('\n') if l.strip()]
             return 'bad' if errs else 'good'
 
         bad_indices = set()
@@ -185,14 +185,15 @@ def _fix_audio_reencode(output_path, ffmpeg):
             ss = i * seg_dur
             t = min(seg_dur, duration - ss)
             seg_path = seg_files[i]
-            tmp_path = seg_path + '.tmp.m4a'
+            tmp_path = seg_path + '.tmp'
             r = subprocess.run(
                 [ffmpeg, '-y', '-v', 'error',
                  '-err_detect', 'ignore_err',
-                 '-fflags', '+genpts+discardcorrupt',
+                 '-fflags', '+genpts',
                  '-ss', f'{ss:.3f}', '-t', f'{t:.3f}',
                  '-i', full_audio,
-                 '-c:a', 'aac', '-ac', '2', '-b:a', '192k', tmp_path],
+                 '-c:a', 'aac', '-ac', '2', '-b:a', '192k',
+                 '-f', 'adts', tmp_path],
                 capture_output=True, text=True, timeout=120)
             if r.returncode == 0 and os.path.exists(tmp_path):
                 os.replace(tmp_path, seg_path)
@@ -206,7 +207,7 @@ def _fix_audio_reencode(output_path, ffmpeg):
                 [ffmpeg, '-y', '-v', 'error',
                  '-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo',
                  '-t', f'{t:.3f}',
-                 '-c:a', 'aac', '-b:a', '192k', seg_path],
+                 '-c:a', 'aac', '-b:a', '192k', '-f', 'adts', seg_path],
                 capture_output=True, text=True, timeout=30)
             return 'silent'
 
@@ -228,22 +229,14 @@ def _fix_audio_reencode(output_path, ffmpeg):
               f"{reencoded}/{total_segs} re-encoded, "
               f"{silent}/{total_segs} silence.{' ' * 20}")
 
-        # Phase 4: Concatenate all segments
+        # Phase 4: Concatenate ADTS segments (binary append — no ffmpeg concat
+        # demuxer, which estimates file duration from size and introduces gaps)
         print("  Concatenating segments...", end='', flush=True)
-        concat_list = os.path.join(tmpdir, 'concat.txt')
-        with open(concat_list, 'w') as f:
+        concat_audio = os.path.join(tmpdir, 'concat.aac')
+        with open(concat_audio, 'wb') as out:
             for seg in seg_files:
-                f.write(f"file '{seg}'\n")
-
-        concat_audio = os.path.join(tmpdir, 'concat_audio.m4a')
-        r = subprocess.run(
-            [ffmpeg, '-y', '-v', 'error',
-             '-f', 'concat', '-safe', '0', '-i', concat_list,
-             '-c:a', 'copy', concat_audio],
-            capture_output=True, text=True, timeout=300)
-        if r.returncode != 0:
-            print(f"\n  WARNING: Concat failed: {(r.stderr or '')[-200:]}")
-            return False
+                with open(seg, 'rb') as inp:
+                    out.write(inp.read())
         print(" done.")
 
         # Phase 5: Mux original video + fixed audio

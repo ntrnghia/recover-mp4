@@ -251,7 +251,7 @@ bool fix_audio(const std::string& output_path) {
     // Build segment file paths
     std::vector<std::string> seg_files(total_segs);
     for (int i = 0; i < total_segs; ++i) {
-        seg_files[i] = (tmpdir / std::format("seg_{:05d}.m4a", i)).string();
+        seg_files[i] = (tmpdir / std::format("seg_{:05d}.aac", i)).string();
     }
 
     // Phase 2: Extract + test segments in parallel
@@ -263,12 +263,17 @@ bool fix_audio(const std::string& output_path) {
         int r = run_ffmpeg({"ffmpeg", "-y", "-v", "error",
                             "-ss", std::format("{:.3f}", ss),
                             "-t", std::format("{:.3f}", t),
-                            "-i", full_audio, "-vn", "-c:a", "copy", seg_path});
+                            "-i", full_audio, "-vn", "-c:a", "copy",
+                            "-f", "adts", seg_path});
         if (r != 0 || !std::filesystem::exists(seg_path)) return false;
 
         std::string err;
         run_ffmpeg({"ffmpeg", "-v", "error", "-i", seg_path, "-f", "null", "-"}, &err);
-        return count_aac_errors(err) == 0;
+        // Reject segment on ANY ffmpeg error (not just AAC-specific) —
+        // oversized frames from corrupt stsz values produce "Invalid data"
+        // errors that do not contain "aac" in the message.
+        for (char c : err) { if (c != '\n' && c != '\r' && c != ' ') return false; }
+        return true;
     };
 
     std::vector<bool> seg_good(total_segs, false);
@@ -307,15 +312,16 @@ bool fix_audio(const std::string& output_path) {
         double ss = i * seg_dur;
         double t = std::min(seg_dur, duration - ss);
         const auto& seg_path = seg_files[i];
-        std::string tmp_path = seg_path + ".tmp.m4a";
+        std::string tmp_path = seg_path + ".tmp";
 
         int r = run_ffmpeg({"ffmpeg", "-y", "-v", "error",
                             "-err_detect", "ignore_err",
-                            "-fflags", "+genpts+discardcorrupt",
+                            "-fflags", "+genpts",
                             "-ss", std::format("{:.3f}", ss),
                             "-t", std::format("{:.3f}", t),
                             "-i", full_audio,
-                            "-c:a", "aac", "-ac", "2", "-b:a", "192k", tmp_path});
+                            "-c:a", "aac", "-ac", "2", "-b:a", "192k",
+                            "-f", "adts", tmp_path});
         if (r == 0 && std::filesystem::exists(tmp_path)) {
             std::filesystem::rename(tmp_path, seg_path);
             ++reencoded;
@@ -326,7 +332,7 @@ bool fix_audio(const std::string& output_path) {
         run_ffmpeg({"ffmpeg", "-y", "-v", "error",
                     "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
                     "-t", std::format("{:.3f}", t),
-                    "-c:a", "aac", "-b:a", "192k", seg_path});
+                    "-c:a", "aac", "-b:a", "192k", "-f", "adts", seg_path});
         ++silent_count;
     };
 
@@ -354,24 +360,17 @@ bool fix_audio(const std::string& output_path) {
                  lossless, total_segs, reencoded.load(), total_segs,
                  silent_count.load(), total_segs, "");
 
-    // Phase 4: Concatenate all segments
+    // Phase 4: Concatenate ADTS segments (binary append — no ffmpeg concat
+    // demuxer, which estimates file duration from size and introduces gaps)
     std::print("  Concatenating segments...");
     std::fflush(stdout);
-    std::string concat_list = (tmpdir / "concat.txt").string();
+    std::string concat_audio = (tmpdir / "concat.aac").string();
     {
-        std::ofstream cl(concat_list);
+        std::ofstream out(concat_audio, std::ios::binary);
         for (const auto& seg : seg_files) {
-            cl << "file '" << seg << "'\n";
+            std::ifstream in(seg, std::ios::binary);
+            out << in.rdbuf();
         }
-    }
-    std::string concat_audio = (tmpdir / "concat_audio.m4a").string();
-    ret = run_ffmpeg({"ffmpeg", "-y", "-v", "error",
-                      "-f", "concat", "-safe", "0", "-i", concat_list,
-                      "-c:a", "copy", concat_audio});
-    if (ret != 0) {
-        std::println(" failed.");
-        cleanup();
-        return false;
     }
     std::println(" done.");
 
